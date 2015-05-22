@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 define('port', type=int, default=8080)
-define('servers', default='')
+define('backends', default='')
 define('cookie_domain', default='localhost:8080')
-define('version_bucket', default='')
+define('weights', default='')
 define('soft_sticky', type=bool, default=True)
 define('hard_sticky', type=bool, default=False)
 
@@ -30,9 +30,10 @@ Backend = namedtuple('Backend', 'host port')
 
 
 class ServerState(object):
-    def __init__(self, backends, version_bucket = None):
-        self.backends = backends
-        self.version_bucket = version_bucket or {}
+
+    def __init__(self, backends=None, weights=None):
+        self.backends = backends or {}
+        self.weights = weights or {}
 
     def backend_for(self, version):
         backends = [backend
@@ -55,11 +56,13 @@ class ServerState(object):
         return [backend for (backend, state) in self.backends.items()
                 if state.healthy]
 
+
 # TODO need this global state to live somewhere. it's set in main()
-server_state = None
+server_state = ServerState()
 
 
 class HealthDeamon(object):
+
     def __init__(self, ioloop, periodicity=1000):
         self.ioloop = ioloop
         self.periodic = PeriodicCallback(self.task, periodicity, self.ioloop)
@@ -110,7 +113,20 @@ class HealthDeamon(object):
                                                       version=version)
 
 
-class ProxyHandler(tornado.web.RequestHandler):
+class BaseHandler(tornado.web.RequestHandler):
+
+    def write_json(self, js):
+        self.write(json.dumps(js))
+        self.write('\n')
+
+    def nope(self, reason, code=504):
+        self.set_status(code)
+        self.write(reason)
+        self.write('\n')
+
+
+class ProxyHandler(BaseHandler):
+
     def requested_version(self):
         """
         Determine what version the user has requested and how strongly they feel
@@ -158,28 +174,31 @@ class ProxyHandler(tornado.web.RequestHandler):
 
 
     def place_user(self):
-        # the user either didn't ask for a particular version, or they nicely
-        # requested a version we couldn't give them. so we try to place them in
-        # a good bucket
+        """
+        the user either didn't ask for a particular version, or they nicely
+        requested a version we couldn't give them. so we try to place them in
+        a version bucket
+        """
 
-        if not server_state.version_bucket:
+        available_versions = server_state.available_versions()
+
+        if not server_state.weights:
             # the administrator hasn't given us any direction as to where they
             # want users placed, so let's just pick the "highest" version
-            available_versions = server_state.available_versions()
             return max(available_versions)
 
         # otherwise take the weights the administator gave us. TODO do a proper
         # random weighting, and try to find a way to make these stickier than
-        # just cookies
+        # just cookies. also ketama instead of this nonsense
         choices = []
-        for version, weight in server_state.version_bucket.items():
-            choices.extend([version]*weight)
-        return random.choice(choices)
+        for version in available_versions:
+            choices.extend([version]*server_state.weights.get(version, 0))
 
+        if choices:
+            return random.choice(choices)
 
-    def nope(self, reason, code=504):
-        self.set_status(code)
-        self.write(reason)
+        return None
+
 
     @tornado.gen.coroutine
     def proxy(self, path):
@@ -199,6 +218,10 @@ class ProxyHandler(tornado.web.RequestHandler):
             # otherwise rebucket them
             version = self.place_user()
 
+        if not version:
+            self.nope("no valid versions")
+            return
+
         backend = server_state.backend_for(version)
 
         if not backend:
@@ -208,9 +231,13 @@ class ProxyHandler(tornado.web.RequestHandler):
         url = 'http://%s:%d/%s' % (backend.host, backend.port, path)
         method = self.request.method
 
+        body = None
+        if method != 'GET':
+            body = self.request.body
+
         try:
             client = tornado.httpclient.AsyncHTTPClient()
-            response = yield client.fetch(url, method=method)
+            response = yield client.fetch(url, method=method, body=body)
         except Exception as e:
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
@@ -241,9 +268,12 @@ class ProxyHandler(tornado.web.RequestHandler):
     get = proxy
     post = proxy
     head = proxy
+    put = proxy
+    delete = proxy
 
 
-class MyHealth(tornado.web.RequestHandler):
+class MyHealth(BaseHandler):
+
     def get(self):
         for_version = self.get_argument('for_version', None)
 
@@ -255,18 +285,81 @@ class MyHealth(tornado.web.RequestHandler):
         ret = {
             'healthy': healthy,
             'versions': list(server_state.available_versions()),
+            'weights': server_state.weights,
             'backends': [{'host': backend.host,
-                          'port': backend.port}
-                          for backend
-                          in server_state.available_backends()],
+                          'port': backend.port,
+                          'healthy': state.healthy,
+                          'version': state.version}
+                         for (backend, state)
+                         in server_state.backends.iteritems()],
         }
 
         self.write(json.dumps(ret))
         self.write('\n') # makes debugging easier to read
 
-class ForceHealth(tornado.web.RequestHandler):
+
+class ExproxymentBackends(BaseHandler):
+
+    def get(self):
+        self.write_json({'backends': [{'host': backend.host,
+                                       'port': backend.port,
+                                       'healthy': state.healthy,
+                                       'version': state.version}
+                                      for (backend, state)
+                                      in server_state.backends.iteritems()]})
+
     def post(self):
         body = json.loads(self.request.body)
+        body = body['backends']
+
+        # validate the format of the servers
+        if not (isinstance(body, list)
+                and (isinstance(k, basestring)
+                     and isinstance(v, basestring)
+                     for (k, v)
+                     in body)):
+            self.set_status('400')
+            self.write(json.dumps({'error': 'bad format'}))
+            return
+
+        new_backends = {}
+
+        for entry in body:
+            backend = Backend(entry['host'], entry['port'])
+            # make sure the inherit the previous state if we already knew about
+            # this server, otherwise this will wipe out all of the servers we
+            # know about and we'll start returning 504s
+            state = server_state.backends.get(backend, BackendState(False, None))
+            new_backends[backend] = state
+
+        # swap them in
+        server_state.backends = new_backends
+
+        # validate the format of the new weights
+        self.write_json({'status': 'ok'})
+
+
+class ExproxymentWeights(BaseHandler):
+
+    def get(self):
+        self.write_json({'weights': server_state.weights})
+
+    def post(self):
+        body = json.loads(self.request.body)
+        body = body['weights']
+
+        # validate the format of the new weights
+        if not (isinstance(body, dict)
+                and (isinstance(k, basestring)
+                     and isinstance(v, (int, long))
+                     for (k, v) in body.items())):
+            self.set_status(400)
+            self.write_json({'error': 'bad format'})
+            return
+
+        server_state.weights = body
+
+        self.write_json({'status': 'ok', 'weights': body})
 
 
 def main():
@@ -275,7 +368,8 @@ def main():
     parse_command_line()
 
     application = tornado.web.Application([
-        (r"/exproxyment/health", ForceHealth),
+        (r"/exproxyment/backends", ExproxymentBackends),
+        (r"/exproxyment/weights", ExproxymentWeights),
         (r"/health", MyHealth),
         (r"/(.*)", ProxyHandler),
     ])
@@ -285,26 +379,25 @@ def main():
     HealthDeamon(ioloop).start()
     application.listen(options.port)
 
-    if not options.servers:
+    if not options.backends:
         raise Exception("--servers is mandatory")
 
     if options.soft_sticky and options.hard_sticky:
         raise Exception("can't be both soft_sticky and hard_sticky")
 
-    servers = options.servers.split(',')
+    servers = options.backends.split(',')
     servers = [server.split(':') for server in servers]
     servers = {Backend(host, int(port)): BackendState(healthy=None,
                                                       version=None)
                for (host, port) in servers}
+    server_state.backends = servers
 
-    version_bucket = None
-    if options.version_bucket:
-        buckets = options.version_bucket.split(',')
+    weights = None
+    if options.weights:
+        buckets = options.weights.split(',')
         buckets = [entry.split(':') for entry in buckets]
         buckets = {version: int(weight) for (version, weight) in buckets}
-        version_bucket = buckets
-
-    server_state = ServerState(servers, version_bucket)
+        server_state.weights = buckets
 
     logger.info("Starting %r on :%d", __file__, options.port)
     ioloop.start()
