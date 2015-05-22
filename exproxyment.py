@@ -228,16 +228,21 @@ class ProxyHandler(BaseHandler):
             self.nope('no backend for %r' % (version,))
             return
 
+        client = tornado.httpclient.AsyncHTTPClient()
         url = 'http://%s:%d/%s' % (backend.host, backend.port, path)
         method = self.request.method
+        headers = deepcopy(self.request.headers)
+
+        headers.add('X-Exproxyment-Version', version)
 
         body = None
         if method != 'GET':
             body = self.request.body
 
         try:
-            client = tornado.httpclient.AsyncHTTPClient()
-            response = yield client.fetch(url, method=method, body=body)
+            response = yield client.fetch(url,
+                                          method=method,
+                                          body=body)
         except Exception as e:
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
