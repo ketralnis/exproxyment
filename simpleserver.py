@@ -8,13 +8,23 @@ import tornado.web
 from tornado.options import define, options, parse_command_line
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 define('port', default=8080)
 define('version', default='1')
+define('insistent', type=bool, default=False)
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
+        if (options.insistent
+            and self.request.headers.get('X-Exproxyment-Version') != options.version):
+            # they gave us the wrong version, tell them to try again
+            self.set_status(406)
+            self.set_header('X-Exproxyment-Wrong-Version', 'true')
+            logging.warn("Got version %r but wanted %r",
+                         self.request.headers.get('X-Exproxyment-Version'),
+                         options.version)
+            return
+
         self.write(json.dumps({
             'port': options.port,
             'version': options.version,

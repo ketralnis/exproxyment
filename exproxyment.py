@@ -12,11 +12,11 @@ import tornado.ioloop
 import tornado.web
 import tornado.gen
 import tornado.httpclient
+import tornado.httputil
 from tornado.ioloop import PeriodicCallback
 from tornado.options import define, options, parse_command_line
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 define('port', type=int, default=8080)
 define('backends', default='')
@@ -145,31 +145,32 @@ class ProxyHandler(BaseHandler):
         requested_version = self.request.headers.get('X-Exproxyment-Request-Version',
                                                      None)
         if requested_version:
-            return False, required_version
+            return False, requested_version
 
         ## cookie
 
         required_version = self.request.cookies.get('exproxyment_require_version',
                                                     None)
-        if requested_version:
-            return False, required_version
+        if required_version:
+            return True, required_version
 
         requested_version = self.request.cookies.get('exproxyment_request_version',
                                                      None)
         if requested_version:
-            return False, required_version
+            return False, requested_version
 
         ## get param
 
         required_version = self.get_argument('exproxyment_require_version',
                                              None)
-        if requested_version:
-            return False, required_version
+        if required_version:
+            return True, required_version
 
         requested_version = self.get_argument('exproxyment_request_version',
                                               None)
         if requested_version:
             return False, requested_version
+
         return False, None
 
 
@@ -201,14 +202,21 @@ class ProxyHandler(BaseHandler):
 
 
     @tornado.gen.coroutine
-    def proxy(self, path):
-        client = tornado.httpclient.AsyncHTTPClient()
+    def proxy(self, path, tries=3):
+        if tries <= 0:
+            self.nope('too many tries')
+            return
 
-        required, version = self.requested_version()
+        client = tornado.httpclient.AsyncHTTPClient()
 
         if not server_state.healthy():
             self.nope('no backends available')
             return
+
+        required, version = self.requested_version()
+
+        if version:
+            logging.debug("User requested version %r (required:%r)", version, required)
 
         if required and version not in server_state.available_versions():
             self.nope("no backend available for %s" % (version,))
@@ -231,7 +239,11 @@ class ProxyHandler(BaseHandler):
         client = tornado.httpclient.AsyncHTTPClient()
         url = 'http://%s:%d/%s' % (backend.host, backend.port, path)
         method = self.request.method
-        headers = deepcopy(self.request.headers)
+
+        headers = tornado.httputil.HTTPHeaders()
+
+        for header, value in self.request.headers.iteritems():
+            headers.add(header, value)
 
         headers.add('X-Exproxyment-Version', version)
 
@@ -242,10 +254,15 @@ class ProxyHandler(BaseHandler):
         try:
             response = yield client.fetch(url,
                                           method=method,
+                                          headers=headers,
                                           body=body)
         except Exception as e:
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
+
+        if response.code == 406 and response.headers.get('X-Exproxyment-Wrong-Version'):
+            ret = yield self.proxy(path, tries=tries-1)
+            raise tornado.gen.Return(ret)
 
         self.set_status(response.code)
 
@@ -289,18 +306,18 @@ class MyHealth(BaseHandler):
 
         ret = {
             'healthy': healthy,
-            'versions': list(server_state.available_versions()),
+            'versions': sorted(list(server_state.available_versions())),
             'weights': server_state.weights,
-            'backends': [{'host': backend.host,
-                          'port': backend.port,
-                          'healthy': state.healthy,
-                          'version': state.version}
-                         for (backend, state)
-                         in server_state.backends.iteritems()],
+            'backends': sorted(({'host': backend.host,
+                                 'port': backend.port,
+                                 'healthy': state.healthy,
+                                 'version': state.version}
+                                for (backend, state)
+                                in server_state.backends.iteritems()),
+                               key=lambda x: (x['host'], x['port'], x['version'])),
         }
 
-        self.write(json.dumps(ret))
-        self.write('\n') # makes debugging easier to read
+        self.write_json(ret)
 
 
 class ExproxymentBackends(BaseHandler):

@@ -6,10 +6,11 @@ from tornado.options import define, options, parse_command_line
 import tornado.httpclient
 
 define('backends', default='')
-define('list_backends', default='')
+define('show_backends', default=False, type=bool)
 define('weights', default='')
-define('list_weights', default='')
+define('show_weights', default=False, type=bool)
 define('server', default='localhost:7000')
+define('show_health', default=False, type=bool)
 
 def configure(path, js=None):
     print path, '->', js if js else ''
@@ -21,7 +22,7 @@ def configure(path, js=None):
     if response.code != 200:
         raise Exception("Code(%d): %s" % (response.code, response.body))
 
-    print response.body
+    print response.body.strip()
 
     return json.loads(response.body)
 
@@ -44,11 +45,14 @@ def main():
                    in weights}
         configure('/exproxyment/weights', {'weights': weights})
 
-    if options.list_backends:
+    if options.show_backends:
         configure('/exproxyment/backends')
 
-    if options.list_weights:
+    if options.show_weights:
         configure('/exproxyment/weights')
+
+    if options.show_health:
+        configure('/health')
 
 
 if __name__ == "__main__":
