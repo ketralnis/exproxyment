@@ -15,8 +15,10 @@ define('insistent', type=bool, default=False)
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
+        requested_version = self.request.headers.get('X-Exproxyment-Version')
+
         if (options.insistent
-            and self.request.headers.get('X-Exproxyment-Version') != options.version):
+            and requested_version != options.version):
             # they gave us the wrong version, tell them to try again
             self.set_status(406)
             self.set_header('X-Exproxyment-Wrong-Version', 'true')

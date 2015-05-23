@@ -34,7 +34,8 @@ def multijob(jobs):
         os.kill(pid, signal.SIGINT)
 
     while pids:
-        logging.debug('waiting on %r more jobs: %r', len(pids), [j[0] for j in pids.values()])
+        logging.debug('waiting on %r more jobs: %r',
+                      len(pids), [j[0] for j in pids.values()])
         died, retcode = os.wait()
         logging.debug('received %r from %r', retcode, pids[died])
         del pids[died]

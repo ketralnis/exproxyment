@@ -137,25 +137,29 @@ class ProxyHandler(BaseHandler):
 
         ## header
 
-        required_version = self.request.headers.get('X-Exproxyment-Require-Version',
-                                                    None)
+        headers = self.request.headers
+
+        required_version = headers.get('X-Exproxyment-Require-Version',
+                                       None)
         if required_version:
             return True, required_version
 
-        requested_version = self.request.headers.get('X-Exproxyment-Request-Version',
-                                                     None)
+        requested_version = headers.get('X-Exproxyment-Request-Version',
+                                        None)
         if requested_version:
             return False, requested_version
 
         ## cookie
 
-        required_version = self.request.cookies.get('exproxyment_require_version',
-                                                    None)
+        cookies = self.request.cookies
+
+        required_version = cookies.get('exproxyment_require_version',
+                                       None)
         if required_version:
             return True, required_version
 
-        requested_version = self.request.cookies.get('exproxyment_request_version',
-                                                     None)
+        requested_version = cookies.get('exproxyment_request_version',
+                                        None)
         if requested_version:
             return False, requested_version
 
@@ -188,7 +192,7 @@ class ProxyHandler(BaseHandler):
             # want users placed, so let's just pick the "highest" version
             return max(available_versions)
 
-        # otherwise take the weights the administator gave us. TODO do a proper
+        # otherwise take the weights the administrator gave us. TODO do a proper
         # random weighting, and try to find a way to make these stickier than
         # just cookies. also ketama instead of this nonsense
         choices = []
@@ -216,7 +220,8 @@ class ProxyHandler(BaseHandler):
         required, version = self.requested_version()
 
         if version:
-            logging.debug("User requested version %r (required:%r)", version, required)
+            logging.debug("User requested version %r (required:%r)",
+                          version, required)
 
         if required and version not in server_state.available_versions():
             self.nope("no backend available for %s" % (version,))
@@ -260,7 +265,10 @@ class ProxyHandler(BaseHandler):
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
 
-        if response.code == 406 and response.headers.get('X-Exproxyment-Wrong-Version'):
+        if (response.code == 406
+            and response.headers.get('X-Exproxyment-Wrong-Version')):
+            # they're telling us that they can't service this version, so they
+            # want us to hit someone else
             ret = yield self.proxy(path, tries=tries-1)
             raise tornado.gen.Return(ret)
 
@@ -314,7 +322,9 @@ class MyHealth(BaseHandler):
                                  'version': state.version}
                                 for (backend, state)
                                 in server_state.backends.iteritems()),
-                               key=lambda x: (x['host'], x['port'], x['version'])),
+                               key=lambda x: (x['host'],
+                                              x['port'],
+                                              x['version'])),
         }
 
         self.write_json(ret)
@@ -351,7 +361,8 @@ class ExproxymentBackends(BaseHandler):
             # make sure the inherit the previous state if we already knew about
             # this server, otherwise this will wipe out all of the servers we
             # know about and we'll start returning 504s
-            state = server_state.backends.get(backend, BackendState(False, None))
+            state = server_state.backends.get(backend,
+                                              BackendState(False, None))
             new_backends[backend] = state
 
         # swap them in
@@ -414,7 +425,6 @@ def main():
                for (host, port) in servers}
     server_state.backends = servers
 
-    weights = None
     if options.weights:
         buckets = options.weights.split(',')
         buckets = [entry.split(':') for entry in buckets]
