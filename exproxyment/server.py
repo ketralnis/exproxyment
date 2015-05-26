@@ -16,6 +16,8 @@ import tornado.httputil
 from tornado.ioloop import PeriodicCallback
 from tornado.options import define, options, parse_command_line
 
+from .utils import parse_backends, parse_weights
+
 logger = logging.getLogger(__name__)
 
 define('port', type=int, default=8080)
@@ -74,8 +76,8 @@ class HealthDeamon(object):
     def task(self):
         # do health checks
         backend, state = random.choice(server_state.backends.items())
-        logger.info("Health checking %r (healthy was %r, version was %r)",
-                    backend, state.healthy, state.version)
+        logger.debug("Health checking %r (healthy was %r, version was %r)",
+                     backend, state.healthy, state.version)
         client = tornado.httpclient.AsyncHTTPClient()
         url = 'http://%s:%d/health' % (backend.host, backend.port)
 
@@ -108,7 +110,7 @@ class HealthDeamon(object):
                                                           version=None)
             return
 
-        logger.info("Healthy %r (%r:%r)", backend, healthy, version)
+        logger.debug("Healthy %r (%r:%r)", backend, healthy, version)
         server_state.backends[backend] = BackendState(healthy=True,
                                                       version=version)
 
@@ -262,6 +264,8 @@ class ProxyHandler(BaseHandler):
                                           headers=headers,
                                           body=body)
         except Exception as e:
+	    # TODO we can allow the client to specify whether
+	    # connection-refused type errors are retryable
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
 
@@ -365,14 +369,16 @@ class ExproxymentBackends(BaseHandler):
                                               BackendState(False, None))
             new_backends[backend] = state
 
+        logging.info("Reconfiguring backends: %r", backends)
+
         # swap them in
         server_state.backends = new_backends
-
-        # validate the format of the new weights
         self.write_json({'status': 'ok'})
 
 
 class ExproxymentWeights(BaseHandler):
+
+    # TODO these should both be atomically settable in one call
 
     def get(self):
         self.write_json({'weights': server_state.weights})
@@ -390,8 +396,9 @@ class ExproxymentWeights(BaseHandler):
             self.write_json({'error': 'bad format'})
             return
 
-        server_state.weights = body
+        logging.info("Reconfiguring weights: %r", body)
 
+        server_state.weights = body
         self.write_json({'status': 'ok', 'weights': body})
 
 
@@ -418,18 +425,15 @@ def main():
     if options.soft_sticky and options.hard_sticky:
         raise Exception("can't be both soft_sticky and hard_sticky")
 
-    servers = options.backends.split(',')
-    servers = [server.split(':') for server in servers]
-    servers = {Backend(host, int(port)): BackendState(healthy=None,
-                                                      version=None)
-               for (host, port) in servers}
+    servers = parse_backends(options.backends)
+    servers = {Backend(host['host'], host['port']): BackendState(healthy=None,
+                                                                 version=None)
+               for host in servers}
     server_state.backends = servers
 
     if options.weights:
-        buckets = options.weights.split(',')
-        buckets = [entry.split(':') for entry in buckets]
-        buckets = {version: int(weight) for (version, weight) in buckets}
-        server_state.weights = buckets
+        weights = parse_weights(options.weights)
+        server_state.weights = weights
 
     logger.info("Starting %r on :%d", __file__, options.port)
     ioloop.start()
