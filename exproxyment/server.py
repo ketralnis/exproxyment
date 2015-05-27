@@ -110,8 +110,6 @@ class HealthDeamon(object):
     def health_check(self, backend):
         state = server_state.backends[backend]
 
-        logger.debug("Health checking %r (healthy was %r, version was %r)",
-                     backend, state.healthy, state.version)
         client = tornado.httpclient.AsyncHTTPClient()
         url = 'http://%s:%d/health' % (backend.host, backend.port)
 
@@ -121,10 +119,14 @@ class HealthDeamon(object):
                                           request_timeout=500)
         except Exception as ex:
             code = 599
+            if state.healthy in (True, None):
+                logger.warn("Bad connection to %r", backend,
+                            exc_info=True)
+            else:
+                logger.debug("Bad connection to %r", backend,
+                             exc_info=True)
         else:
             code = response.code
-
-        logger.debug("%r(%r) responded to health with code:%d", backend, state, code)
 
         if code != 200:
             server_state.backends[backend] = BackendState(healthy=False,
@@ -141,13 +143,13 @@ class HealthDeamon(object):
                 server_state.backends[backend] = BackendState(healthy=True,
                                                               version=version)
 
-        if state.healthy != server_state.backends[backend].healthy:
-            logger.warn("%r.healthy %r->%r",
-                        backend,
-                        state.healthy,
-                        server_state.backends[backend].healthy)
-
-        # logger.debug("Healthy %r (%r:%r)", backend, healthy, version)
+        if state != server_state.backends[backend]:
+            logger.warn("%r: %r -> %r",
+                        backend, state, server_state.backends[backend])
+        else:
+            logger.debug("%r: %r -> %r (%d)",
+                         backend, state, server_state.backends[backend],
+                         code)
 
 
 class BaseHandler(tornado.web.RequestHandler):
