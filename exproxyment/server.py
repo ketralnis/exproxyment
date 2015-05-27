@@ -17,6 +17,7 @@ from tornado.ioloop import PeriodicCallback
 from tornado.options import define, options, parse_command_line
 
 from .utils import parse_backends, parse_weights
+from .utils import unparse_backends, unparse_weights
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,20 @@ define('weights', default='')
 define('soft_sticky', type=bool, default=True)
 define('hard_sticky', type=bool, default=False)
 
-BackendState = namedtuple('BackendState', 'healthy version')
+
+class BackendState(namedtuple('BackendState', 'healthy version')):
+    def __repr__(self):
+        healthy = {
+            None: 'unknown',
+            True: 'healthy',
+            False: 'unhealthy',
+        }
+        if self.healthy:
+            return ("<BackendState %s v=%s>"
+                    % (healthy[self.healthy], self.version))
+        else:
+            return ("<BackendState %s>"
+                    % (healthy[self.healthy],))
 
 class Backend(namedtuple('Backend', 'host port')):
     def __repr__(self):
@@ -369,7 +383,7 @@ class MyHealth(BaseHandler):
         self.write_json(ret)
 
 
-class ExproxymentBackends(BaseHandler):
+class ExproxymentConfigure(BaseHandler):
 
     def get(self):
         self.write_json({'backends': [{'host': backend.host,
@@ -377,64 +391,63 @@ class ExproxymentBackends(BaseHandler):
                                        'healthy': state.healthy,
                                        'version': state.version}
                                       for (backend, state)
-                                      in server_state.backends.iteritems()]})
+                                      in server_state.backends.iteritems()],
+                         'weights': server_state.weights})
 
     def post(self):
         body = json.loads(self.request.body)
-        body = body['backends']
 
-        # validate the format of the servers
-        if not (isinstance(body, list)
-                and (isinstance(k, basestring)
-                     and isinstance(v, basestring)
-                     for (k, v)
-                     in body)):
-            self.set_status('400')
-            self.write(json.dumps({'error': 'bad format'}))
-            return
+        if 'backends' in body:
+            backends = body['backends']
 
-        new_backends = {}
+            # validate the format of the servers
+            if not (isinstance(backends, list)
+                    and (isinstance(k, basestring)
+                         and isinstance(v, basestring)
+                         for (k, v)
+                         in backends)):
+                self.set_status('400')
+                self.write(json.dumps({'error': 'bad format'}))
+                return
 
-        for entry in body:
-            backend = Backend(entry['host'], entry['port'])
-            # make sure the inherit the previous state if we already knew about
-            # this server, otherwise this will wipe out all of the servers we
-            # know about and we'll start returning 504s
-            state = server_state.backends.get(backend,
-                                              BackendState(None, None))
-            new_backends[backend] = state
+            new_backends = {}
 
-        logger.info("Reconfiguring backends: %r", backends)
+            for entry in backends:
+                backend = Backend(entry['host'], entry['port'])
+                # make sure to inherit the previous state if we already knew
+                # about this server, otherwise this will wipe out all of the
+                # health checks we know about and we'll start returning 504s
+                state = server_state.backends.get(backend,
+                                                  BackendState(None, None))
+                new_backends[backend] = state
 
-        # swap them in
-        server_state.backends = new_backends
-        self.write_json({'status': 'ok'})
+            logger.info("Reconfiguring backends: %r", backends)
+
+            # swap them in
+            server_state.backends = new_backends
+
+        if 'weights' in body:
+            weights = body['weights']
+
+            # validate the format of the new weights
+            if not (isinstance(weights, dict)
+                    and (isinstance(k, basestring)
+                         and isinstance(v, (int, long))
+                         for (k, v) in weights.items())):
+                self.set_status(400)
+                self.write_json({'error': 'bad format'})
+                return
+
+            logger.info("Reconfiguring weights: %r", weights)
+
+            server_state.weights = weights
+
+        return self.get()
 
 
-class ExproxymentWeights(BaseHandler):
-
-    # TODO these should both be atomically settable in one call
-
-    def get(self):
-        self.write_json({'weights': server_state.weights})
-
-    def post(self):
-        body = json.loads(self.request.body)
-        body = body['weights']
-
-        # validate the format of the new weights
-        if not (isinstance(body, dict)
-                and (isinstance(k, basestring)
-                     and isinstance(v, (int, long))
-                     for (k, v) in body.items())):
-            self.set_status(400)
-            self.write_json({'error': 'bad format'})
-            return
-
-        logger.info("Reconfiguring weights: %r", body)
-
-        server_state.weights = body
-        self.write_json({'status': 'ok', 'weights': body})
+class FourOhFour(BaseHandler):
+    def get(self, *a):
+        self.set_status(404)
 
 
 def main():
@@ -443,9 +456,10 @@ def main():
     parse_command_line()
 
     application = tornado.web.Application([
-        (r"/exproxyment/backends", ExproxymentBackends),
-        (r"/exproxyment/weights", ExproxymentWeights),
+        (r"/exproxyment/configure", ExproxymentConfigure),
+        (r"/exproxyment.+", FourOhFour),
         (r"/health", MyHealth),
+        (r"/health.+", FourOhFour),
         (r"/(.*)", ProxyHandler),
     ])
 

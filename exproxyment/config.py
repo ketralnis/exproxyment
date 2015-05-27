@@ -1,6 +1,7 @@
 #!/usr/bin/env python2.7
 
 import json
+import logging
 
 from tornado.options import define, options, parse_command_line
 import tornado.httpclient
@@ -9,50 +10,56 @@ from .utils import parse_backends, parse_weights
 from .utils import unparse_backends, unparse_weights
 
 define('backends', default='')
-define('show_backends', default=False, type=bool)
+define('show', default=False, type=bool)
 define('weights', default='')
-define('show_weights', default=False, type=bool)
 define('server', default='localhost:7000')
-define('show_health', default=False, type=bool)
+define('health', default=False, type=bool)
 define('json', type=bool, default=False)
 
 def configure(path, js=None):
     client = tornado.httpclient.HTTPClient()
-    response = client.fetch("http://%s%s" % (options.server, path),
-                            method='POST' if js else 'GET',
+    url = "http://%s%s" % (options.server, path)
+    method = 'POST' if js else 'GET'
+
+    logging.debug("%s %s", method, url)
+
+    response = client.fetch(url,
+                            method=method,
                             body=json.dumps(js) if js else None)
 
+    logging.debug("%s %s (%d):\n%s", method, url, response.code,
+                  response.body and response.body.strip())
+
     if response.code != 200:
-        raise Exception("Code(%d): %s" % (response.code, response.body))
+        raise Exception("%s %s code(%d): %s"
+                        % (method, url, response.code, response.body))
 
     return json.loads(response.body)
 
 def main():
     parse_command_line()
 
-    if options.backends:
-        backends = parse_backends(options.backends)
-        configure('/exproxyment/backends', {'backends': backends})
+    if options.backends or options.weights:
+        config = {}
 
-    if options.weights:
-        weights = parse_weights(options.weights)
-        configure('/exproxyment/weights', {'weights': weights})
+        if options.backends:
+            config['backends'] = parse_backends(options.backends)
 
-    if options.show_backends:
-        ret = configure('/exproxyment/backends')
+        if options.weights:
+            config['weights'] = parse_weights(options.weights)
+
+        configure('/exproxyment/configure', config)
+
+    if options.show:
+        ret = configure('/exproxyment/configure')
+
         if options.json:
             print json.dumps(ret)
         else:
-            print unparse_backends(ret['backends'])
+            print 'backends:', unparse_backends(ret['backends'])
+            print 'weights:', unparse_weights(ret['weights'])
 
-    if options.show_weights:
-        ret = configure('/exproxyment/weights')
-        if options.json:
-            print json.dumps(ret)
-        else:
-            print unparse_weights(ret['weights'])
-
-    if options.show_health:
+    if options.health:
         ret = configure('/health')
         if options.json:
             print json.dumps(ret)
