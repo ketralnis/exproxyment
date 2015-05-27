@@ -6,6 +6,10 @@ def parse_backends(b_str):
                 in backends]
     return backends
 
+def unparse_backends(b_json):
+    return ','.join('%s:%d' % (b['host'], b['port'])
+                    for b in b_json)
+
 def parse_weights(w_str):
     weights = w_str.split(',')
     weights = map(lambda s: s.split(':'), weights)
@@ -13,3 +17,8 @@ def parse_weights(w_str):
                for (version, weight)
                in weights}
     return weights
+
+def unparse_weights(w_json):
+    return ','.join('%s:%d' % (version, weight)
+                    for version, weight
+                    in w_json.items())

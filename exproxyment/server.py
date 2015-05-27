@@ -28,7 +28,10 @@ define('soft_sticky', type=bool, default=True)
 define('hard_sticky', type=bool, default=False)
 
 BackendState = namedtuple('BackendState', 'healthy version')
-Backend = namedtuple('Backend', 'host port')
+
+class Backend(namedtuple('Backend', 'host port')):
+    def __repr__(self):
+        return "<Backend %s:%d>" % (self.host, self.port)
 
 
 class ServerState(object):
@@ -72,10 +75,41 @@ class HealthDeamon(object):
     def start(self):
         self.periodic.start()
 
+    @staticmethod
+    def twofilter(pred, it):
+        falses, trues = [], []
+        for item in it:
+            if pred(item):
+                trues.append(item)
+            else:
+                falses.append(item)
+
+        return falses, trues
+
     @tornado.gen.coroutine
     def task(self):
-        # do health checks
-        backend, state = random.choice(server_state.backends.items())
+        unseen, seen = self.twofilter(
+            lambda backend: server_state.backends[backend].healthy is not None,
+            server_state.backends)
+
+        futs = []
+
+        for backend in unseen:
+            # if there's anyone we haven't ever seen before, fire off all of
+            # those checks at once
+            futs.append(self.health_check(backend))
+
+        if seen:
+            # randomly check on the ones we've seen ebfore
+            backend = random.choice(seen)
+            futs.append(self.health_check(backend))
+
+        yield futs
+
+    @tornado.gen.coroutine
+    def health_check(self, backend):
+        state = server_state.backends[backend]
+
         logger.debug("Health checking %r (healthy was %r, version was %r)",
                      backend, state.healthy, state.version)
         client = tornado.httpclient.AsyncHTTPClient()
@@ -90,29 +124,30 @@ class HealthDeamon(object):
         else:
             code = response.code
 
-        if code not in (200, 599):
-            logger.info("%r responded with code:%d", backend, code)
-        else:
-            logger.debug("%r responded with code:%d", backend, code)
+        logger.debug("%r(%r) responded to health with code:%d", backend, state, code)
 
         if code != 200:
-
             server_state.backends[backend] = BackendState(healthy=False,
                                                           version=None)
-            return
+        else:
+            body = json.loads(response.body)
+            healthy = body.get('healthy', False)
+            version = body.get('version', None)
+            if healthy is not True or not version:
+                logger.info("Unhealthy %r (%r:%r)", backend, healthy, version)
+                server_state.backends[backend] = BackendState(healthy=False,
+                                                              version=None)
+            else:
+                server_state.backends[backend] = BackendState(healthy=True,
+                                                              version=version)
 
-        body = json.loads(response.body)
-        healthy = body.get('healthy', False)
-        version = body.get('version', None)
-        if healthy is not True or not version:
-            logger.info("Unhealthy %r (%r:%r)", backend, healthy, version)
-            server_state.backends[backend] = BackendState(healthy=False,
-                                                          version=None)
-            return
+        if state.healthy != server_state.backends[backend].healthy:
+            logger.warn("%r.healthy %r->%r",
+                        backend,
+                        state.healthy,
+                        server_state.backends[backend].healthy)
 
-        logger.debug("Healthy %r (%r:%r)", backend, healthy, version)
-        server_state.backends[backend] = BackendState(healthy=True,
-                                                      version=version)
+        # logger.debug("Healthy %r (%r:%r)", backend, healthy, version)
 
 
 class BaseHandler(tornado.web.RequestHandler):
@@ -137,7 +172,7 @@ class ProxyHandler(BaseHandler):
         returns a tuple of (Required, Version)
         """
 
-        ## header
+        # header
 
         headers = self.request.headers
 
@@ -151,7 +186,7 @@ class ProxyHandler(BaseHandler):
         if requested_version:
             return False, requested_version
 
-        ## cookie
+        # cookie
 
         cookies = self.request.cookies
 
@@ -165,7 +200,7 @@ class ProxyHandler(BaseHandler):
         if requested_version:
             return False, requested_version
 
-        ## get param
+        # get param
 
         required_version = self.get_argument('exproxyment_require_version',
                                              None)
@@ -178,7 +213,6 @@ class ProxyHandler(BaseHandler):
             return False, requested_version
 
         return False, None
-
 
     def place_user(self):
         """
@@ -199,13 +233,12 @@ class ProxyHandler(BaseHandler):
         # just cookies. also ketama instead of this nonsense
         choices = []
         for version in available_versions:
-            choices.extend([version]*server_state.weights.get(version, 0))
+            choices.extend([version] * server_state.weights.get(version, 0))
 
         if choices:
             return random.choice(choices)
 
         return None
-
 
     @tornado.gen.coroutine
     def proxy(self, path, tries=3):
@@ -222,7 +255,7 @@ class ProxyHandler(BaseHandler):
         required, version = self.requested_version()
 
         if version:
-            logging.debug("User requested version %r (required:%r)",
+            logger.debug("User requested version %r (required:%r)",
                           version, required)
 
         if required and version not in server_state.available_versions():
@@ -264,16 +297,16 @@ class ProxyHandler(BaseHandler):
                                           headers=headers,
                                           body=body)
         except Exception as e:
-	    # TODO we can allow the client to specify whether
-	    # connection-refused type errors are retryable
+            # TODO we can allow the client to specify whether
+            # connection-refused type errors are retryable
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
 
         if (response.code == 406
-            and response.headers.get('X-Exproxyment-Wrong-Version')):
+                and response.headers.get('X-Exproxyment-Wrong-Version')):
             # they're telling us that they can't service this version, so they
             # want us to hit someone else
-            ret = yield self.proxy(path, tries=tries-1)
+            ret = yield self.proxy(path, tries=tries - 1)
             raise tornado.gen.Return(ret)
 
         self.set_status(response.code)
@@ -366,10 +399,10 @@ class ExproxymentBackends(BaseHandler):
             # this server, otherwise this will wipe out all of the servers we
             # know about and we'll start returning 504s
             state = server_state.backends.get(backend,
-                                              BackendState(False, None))
+                                              BackendState(None, None))
             new_backends[backend] = state
 
-        logging.info("Reconfiguring backends: %r", backends)
+        logger.info("Reconfiguring backends: %r", backends)
 
         # swap them in
         server_state.backends = new_backends
@@ -396,7 +429,7 @@ class ExproxymentWeights(BaseHandler):
             self.write_json({'error': 'bad format'})
             return
 
-        logging.info("Reconfiguring weights: %r", body)
+        logger.info("Reconfiguring weights: %r", body)
 
         server_state.weights = body
         self.write_json({'status': 'ok', 'weights': body})
@@ -416,9 +449,6 @@ def main():
 
     ioloop = tornado.ioloop.IOLoop.instance()
 
-    HealthDeamon(ioloop).start()
-    application.listen(options.port)
-
     if not options.backends:
         raise Exception("--servers is mandatory")
 
@@ -435,7 +465,10 @@ def main():
         weights = parse_weights(options.weights)
         server_state.weights = weights
 
-    logger.info("Starting %r on :%d", __file__, options.port)
+    HealthDeamon(ioloop).start()
+    application.listen(options.port)
+
+    logger.info("Starting on :%d", options.port)
     ioloop.start()
 
 
