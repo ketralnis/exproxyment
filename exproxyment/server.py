@@ -189,44 +189,28 @@ class ProxyHandler(BaseHandler):
         """
 
         # header
+        for required, headername in zip(('X-Exproxyment-Require-Version',
+                                         'X-Exproxyment-Request-Version'),
+                                        (True, False)):
+            version = self.request.headers.get(headername, None)
+            if version:
+                return required, version
 
-        headers = self.request.headers
-
-        required_version = headers.get('X-Exproxyment-Require-Version',
-                                       None)
-        if required_version:
-            return True, required_version
-
-        requested_version = headers.get('X-Exproxyment-Request-Version',
-                                        None)
-        if requested_version:
-            return False, requested_version
+        # get argument
+        for required, getargname in zip(('exproxyment_require_version',
+                                         'exproxyment_request_version'),
+                                        (True, False)):
+            version = self.get_argument(getargname, None)
+            if version:
+                return required, version
 
         # cookie
-
-        cookies = self.request.cookies
-
-        required_version = cookies.get('exproxyment_require_version',
-                                       None)
-        if required_version:
-            return True, required_version
-
-        requested_version = cookies.get('exproxyment_request_version',
-                                        None)
-        if requested_version:
-            return False, requested_version
-
-        # get param
-
-        required_version = self.get_argument('exproxyment_require_version',
-                                             None)
-        if required_version:
-            return True, required_version
-
-        requested_version = self.get_argument('exproxyment_request_version',
-                                              None)
-        if requested_version:
-            return False, requested_version
+        for required, cookiename in zip(('exproxyment_require_version',
+                                         'exproxyment_request_version'),
+                                        (True, False)):
+            version = self.request.cookies.get(cookiename)
+            if version:
+                return required, version
 
         return False, None
 
