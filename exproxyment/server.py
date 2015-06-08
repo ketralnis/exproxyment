@@ -482,7 +482,7 @@ class RegisterSelfHandler(BaseHandler):
 class DeregisterSelfHandler(BaseHandler):
 
     """
-    Like ExproxymentConfigure but takes a list of *new* backends to register
+    Like RegisterSelfHandler but takes a list of backends to deregister
     """
 
     def post(self):
