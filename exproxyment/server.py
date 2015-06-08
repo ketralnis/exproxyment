@@ -30,6 +30,7 @@ define('hard_sticky', type=bool, default=False)
 
 
 class BackendState(namedtuple('BackendState', 'healthy version')):
+
     def __repr__(self):
         healthy = {
             None: 'unknown',
@@ -43,7 +44,9 @@ class BackendState(namedtuple('BackendState', 'healthy version')):
             return ("<BackendState %s>"
                     % (healthy[self.healthy],))
 
+
 class Backend(namedtuple('Backend', 'host port')):
+
     def __repr__(self):
         return "<Backend %s:%d>" % (self.host, self.port)
 
@@ -75,15 +78,41 @@ class ServerState(object):
         return [backend for (backend, state) in self.backends.items()
                 if state.healthy]
 
+    def set_backends(self, backends):
+        # make sure to inherit the previous state if we already knew about this
+        # server, otherwise re-adding an existing backend will wipe out all of
+        # the health checks we know about and we'll start returning 504s
+
+        current_backends = self.backends
+        self.backends = {}
+
+        for backend in backends:
+            self.backends[backend] = current_backends.get(backend,
+                                                          BackendState(None, None))
+
+    def add_backend(self, backend):
+        self.backends[backend] = self.backends.get(backend,
+                                                   BackendState(None, None))
+
+    def remove_backend(self, backend):
+        if backend in self.backends:
+            del self.backends[backend]
+
 
 # TODO need this global state to live somewhere. it's set in main()
 server_state = ServerState()
 
 
-class HealthDeamon(object):
+class HealthDaemon(object):
+
+    """
+    Every second, check on every backend that's never been seen before, as well
+    as one backend chosen at random
+    """
 
     def __init__(self, ioloop, periodicity=1000):
         self.ioloop = ioloop
+        self.check_count = 0
         self.periodic = PeriodicCallback(self.task, periodicity, self.ioloop)
 
     def start(self):
@@ -102,27 +131,29 @@ class HealthDeamon(object):
 
     @tornado.gen.coroutine
     def task(self):
+        self.check_count += 1
+
         unseen, seen = self.twofilter(
             lambda backend: server_state.backends[backend].healthy is not None,
             server_state.backends)
 
-        futs = []
+        futs = {}
 
         for backend in unseen:
             # if there's anyone we haven't ever seen before, fire off all of
             # those checks at once
-            futs.append(self.health_check(backend))
+            futs[backend] = self.health_check(backend)
 
         if seen:
-            # randomly check on the ones we've seen ebfore
+            # also randomly check on the ones we've seen before
             backend = random.choice(seen)
-            futs.append(self.health_check(backend))
+            futs[backend] = self.health_check(backend)
 
-        yield futs
+        yield futs.values()
 
     @tornado.gen.coroutine
     def health_check(self, backend):
-        state = server_state.backends[backend]
+        oldstate = server_state.backends[backend]
 
         client = tornado.httpclient.AsyncHTTPClient()
         url = 'http://%s:%d/health' % (backend.host, backend.port)
@@ -131,16 +162,21 @@ class HealthDeamon(object):
             response = yield client.fetch(url,
                                           connect_timeout=500,
                                           request_timeout=500)
-        except Exception as ex:
+        except Exception as exc:
             code = 599
-            if state.healthy in (True, None):
-                logger.warn("Bad connection to %r", backend,
-                            exc_info=True)
+            if oldstate.healthy in (True, None):
+                logger.warn("Bad connection to %r (%s)", backend, exc)
             else:
-                logger.debug("Bad connection to %r", backend,
-                             exc_info=True)
+                logger.debug("Bad connection to %r (%s)", backend, exc)
         else:
             code = response.code
+
+        if backend not in server_state.backends:
+            # a server was removed while were in the process of checking on it.
+            # disregard any health info that we got from it
+            logger.debug("Backend %r disappeared while we were checking on it",
+                         backend)
+            return
 
         if code != 200:
             server_state.backends[backend] = BackendState(healthy=False,
@@ -157,24 +193,30 @@ class HealthDeamon(object):
                 server_state.backends[backend] = BackendState(healthy=True,
                                                               version=version)
 
-        if state != server_state.backends[backend]:
+        if oldstate != server_state.backends[backend]:
             logger.warn("%r: %r -> %r",
-                        backend, state, server_state.backends[backend])
+                        backend, oldstate, server_state.backends[backend])
         else:
             logger.debug("%r: %r -> %r (%d)",
-                         backend, state, server_state.backends[backend],
+                         backend, oldstate, server_state.backends[backend],
                          code)
 
 
 class BaseHandler(tornado.web.RequestHandler):
 
     def write_json(self, js):
+        self.set_header('Content-Type', 'application/json; charset=utf-8')
         self.write(json.dumps(js))
         self.write('\n')
 
     def nope(self, reason, code=504):
         self.set_status(code)
-        self.write(reason)
+
+        if isinstance(reason, dict):
+            self.write_json(reason)
+        else:
+            self.write(reason)
+
         self.write('\n')
 
 
@@ -256,7 +298,7 @@ class ProxyHandler(BaseHandler):
 
         if version:
             logger.debug("User requested version %r (required:%r)",
-                          version, required)
+                         version, required)
 
         if required and version not in server_state.available_versions():
             self.nope("no backend available for %s" % (version,))
@@ -341,6 +383,12 @@ class ProxyHandler(BaseHandler):
 
 class MyHealth(BaseHandler):
 
+    """
+    The health of the exproxyment daemon. We are healthy if we have at least one
+    healthy backend for the requested version (or any healthy backends if no
+    version is specified)
+    """
+
     def get(self):
         for_version = self.get_argument('for_version', None)
 
@@ -369,6 +417,10 @@ class MyHealth(BaseHandler):
 
 class ExproxymentConfigure(BaseHandler):
 
+    """
+    Replace the backends or version weighting configuration of a running sever
+    """
+
     def get(self):
         self.write_json({'backends': [{'host': backend.host,
                                        'port': backend.port,
@@ -382,33 +434,13 @@ class ExproxymentConfigure(BaseHandler):
         body = json.loads(self.request.body)
 
         if 'backends' in body:
-            backends = body['backends']
+            try:
+                new_backends = validate_backend_json(body['backends'])
+            except ValueError:
+                return self.nope({'error': 'bad format: backends'}, code=400)
 
-            # validate the format of the servers
-            if not (isinstance(backends, list)
-                    and (isinstance(k, basestring)
-                         and isinstance(v, basestring)
-                         for (k, v)
-                         in backends)):
-                self.set_status('400')
-                self.write(json.dumps({'error': 'bad format'}))
-                return
-
-            new_backends = {}
-
-            for entry in backends:
-                backend = Backend(entry['host'], entry['port'])
-                # make sure to inherit the previous state if we already knew
-                # about this server, otherwise this will wipe out all of the
-                # health checks we know about and we'll start returning 504s
-                state = server_state.backends.get(backend,
-                                                  BackendState(None, None))
-                new_backends[backend] = state
-
-            logger.info("Reconfiguring backends: %r", backends)
-
-            # swap them in
-            server_state.backends = new_backends
+            logger.info("Reconfiguring backends: %r", new_backends)
+            server_state.set_backends(new_backends)
 
         if 'weights' in body:
             weights = body['weights']
@@ -418,20 +450,94 @@ class ExproxymentConfigure(BaseHandler):
                     and (isinstance(k, basestring)
                          and isinstance(v, (int, long))
                          for (k, v) in weights.items())):
-                self.set_status(400)
-                self.write_json({'error': 'bad format'})
-                return
+                return self.nope('bad format: weights', code=400)
 
             logger.info("Reconfiguring weights: %r", weights)
-
             server_state.weights = weights
 
         return self.get()
 
 
+class RegisterSelfHandler(BaseHandler):
+
+    """
+    Like ExproxymentConfigure but takes a list of *new* backends to register
+    """
+
+    def post(self):
+        body = json.loads(self.request.body)
+
+        try:
+            backends = validate_backend_json(body['backends'])
+        except (KeyError, ValueError):
+            return self.nope('bad format: backends', code=400)
+
+        for backend in backends:
+            logger.info("Registering backend %r", backend)
+            server_state.add_backend(backend)
+
+        self.write_json({'status': 'ok'})
+
+
+class DeregisterSelfHandler(BaseHandler):
+
+    """
+    Like ExproxymentConfigure but takes a list of *new* backends to register
+    """
+
+    def post(self):
+        body = json.loads(self.request.body)
+
+        try:
+            backends = validate_backend_json(body['backends'])
+        except (KeyError, ValueError):
+            return self.nope('bad format: backends', code=400)
+
+        for backend in backends:
+            logger.info("Deregistering backend %r", backend)
+            server_state.remove_backend(backend)
+
+        self.write_json({'status': 'ok'})
+
+
 class FourOhFour(BaseHandler):
+
     def get(self, *a):
         self.set_status(404)
+
+
+def validate_backend_json(backends):
+    # validate the format of the servers TODO duplicated with above
+    if not (isinstance(backends, list)
+            and (isinstance(k, basestring)
+                 and isinstance(v, basestring)
+                 for (k, v)
+                 in backends)):
+        raise ValueError
+
+    ret = []
+
+    for entry in backends:
+        ret.append(Backend(entry['host'], entry['port']))
+
+    return ret
+
+
+class ExproxymentApplication(tornado.web.Application):
+
+    def __init__(self):
+        super(ExproxymentApplication, self).__init__([
+            (r"/exproxyment/configure", ExproxymentConfigure),
+            (r"/exproxyment/register", RegisterSelfHandler),
+            (r"/exproxyment/deregister", DeregisterSelfHandler),
+
+            # reserve the rest of this namespace for ourselves
+            (r"/exproxyment.+", FourOhFour),
+
+            (r"/health", MyHealth),
+            (r"/health.+", FourOhFour),
+            (r"/(.*)", ProxyHandler),
+        ])
 
 
 def main():
@@ -439,33 +545,24 @@ def main():
 
     parse_command_line()
 
-    application = tornado.web.Application([
-        (r"/exproxyment/configure", ExproxymentConfigure),
-        (r"/exproxyment.+", FourOhFour),
-        (r"/health", MyHealth),
-        (r"/health.+", FourOhFour),
-        (r"/(.*)", ProxyHandler),
-    ])
-
     ioloop = tornado.ioloop.IOLoop.instance()
 
-    if not options.backends:
-        raise Exception("--servers is mandatory")
+    application = ExproxymentApplication()
 
     if options.soft_sticky and options.hard_sticky:
         raise Exception("can't be both soft_sticky and hard_sticky")
 
-    servers = parse_backends(options.backends)
-    servers = {Backend(host['host'], host['port']): BackendState(healthy=None,
-                                                                 version=None)
-               for host in servers}
-    server_state.backends = servers
+    if options.backends:
+        backends = parse_backends(options.backends)
+        backends = [Backend(host['host'], host['port'])
+                    for host in backends]
+        server_state.set_backends(backends)
 
     if options.weights:
         weights = parse_weights(options.weights)
         server_state.weights = weights
 
-    HealthDeamon(ioloop).start()
+    HealthDaemon(ioloop).start()
     application.listen(options.port)
 
     logger.info("Starting on :%d", options.port)

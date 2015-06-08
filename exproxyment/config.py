@@ -11,10 +11,13 @@ from .utils import unparse_backends, unparse_weights
 
 define('backends', default='')
 define('show', default=False, type=bool)
+define('add', default=None, type=str)
+define('remove', default=None, type=str)
 define('weights', default='')
 define('server', default='localhost:7000')
 define('health', default=False, type=bool)
 define('json', type=bool, default=False)
+
 
 def configure(path, js=None):
     client = tornado.httpclient.HTTPClient()
@@ -36,6 +39,7 @@ def configure(path, js=None):
 
     return json.loads(response.body)
 
+
 def main():
     parse_command_line()
 
@@ -49,6 +53,14 @@ def main():
             config['weights'] = parse_weights(options.weights)
 
         configure('/exproxyment/configure', config)
+
+    if options.add:
+        config = {'backends': parse_backends(options.add)}
+        configure('/exproxyment/register', config)
+
+    if options.remove:
+        config = {'backends': parse_backends(options.remove)}
+        configure('/exproxyment/deregister', config)
 
     if options.show:
         ret = configure('/exproxyment/configure')

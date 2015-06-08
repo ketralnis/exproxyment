@@ -5,6 +5,7 @@ import sys
 import signal
 import logging
 
+
 def multijob(jobs):
     pids = {}
 
@@ -39,6 +40,7 @@ def multijob(jobs):
         died, retcode = os.wait()
         logging.debug('received %r from %r', retcode, pids[died])
         del pids[died]
+
 
 def splitlist(l, sep):
     ret = [[]]
