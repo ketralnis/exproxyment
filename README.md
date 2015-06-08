@@ -18,3 +18,5 @@ problem
 * Better control over timeouts and connection limits
 * Can we avoid having the whole request/response bodies in memory?
 * The "test suite" sucks
+* Roll the `exproxyment.server` and `exproxyment.config` entrypoints into actual
+  scripts that setup.py installs
