@@ -73,9 +73,16 @@ curl -v http://localhost:7000 -b 'exproxyment_request_version='%7B%22version%22%
 
 # cookie round trip
 rm -fv cookie.jar
-v=$(curl -v -c cookie.jar http://localhost:7000 2>&1 | awk '/X-Exproxyment-Version/ {print $3}')
-echo "Selected version: " $v
-# make sure we get the same version
-curl -v -c cookie.jar http://localhost:7000 2>&1 | grep "$v"
+v1=`curl -v -b cookie.jar -c cookie.jar http://127.0.0.1:7000/ 2>&1 | awk '/X-Exproxyment-Version/ {print $3}'`
+echo "$v1" | grep -E '(past|present)'
+v2=`curl -v -b cookie.jar -c cookie.jar http://127.0.0.1:7000/ 2>&1 | awk '/X-Exproxyment-Version/ {print $3}'`
+echo "$v2" | grep -E '(past|present)'
+ls -l cookie.jar
+cat cookie.jar
+
+echo "request for $v1 got $v2"
+[ "$v1" = "$v2" ]
+
+rm cookie.jar
 
 echo 'success!'

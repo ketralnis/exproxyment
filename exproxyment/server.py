@@ -19,9 +19,9 @@ from .utils import unparse_backends, unparse_weights
 
 logger = logging.getLogger(__name__)
 
-define('port', type=int, default=8080)
+define('port', type=int, default=7000)
 define('backends', default='')
-define('cookie_domain', default='localhost:8080')
+define('cookie_domain', default=None)
 define('weights', default='')
 define('soft_sticky', type=bool, default=True)
 define('hard_sticky', type=bool, default=False)
