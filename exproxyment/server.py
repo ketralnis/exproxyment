@@ -2,11 +2,9 @@
 
 from collections import namedtuple
 import logging
-from functools import partial
 import random
 import json
 import urllib
-from copy import deepcopy
 
 import tornado.ioloop
 import tornado.web
@@ -44,11 +42,28 @@ class BackendState(namedtuple('BackendState', 'healthy version')):
             return ("<BackendState %s>"
                     % (healthy[self.healthy],))
 
+    def to_json(self):
+        return {'healthy': self.healthy,
+                'version': self.version}
+
 
 class Backend(namedtuple('Backend', 'host port')):
 
     def __repr__(self):
         return "<Backend %s:%d>" % (self.host, self.port)
+
+    def to_json(self):
+        return {'host': self.host,
+                'port': self.port}
+
+
+class ActiveRequest(namedtuple('ActiveRequest', ('source_host', 'uri',
+                                                 'backend'))):
+
+    def to_json(self):
+        return {'source_host': self.source_host,
+                'backend': self.backend.to_json(),
+                'uri': self.uri}
 
 
 class ServerState(object):
@@ -56,6 +71,7 @@ class ServerState(object):
     def __init__(self, backends=None, weights=None):
         self.backends = backends or {}
         self.weights = weights or {}
+        self.requests = set()
 
     def backend_for(self, version):
         backends = [backend
@@ -231,27 +247,28 @@ class ProxyHandler(BaseHandler):
         """
 
         # header
-        for required, headername in zip(('X-Exproxyment-Require-Version',
-                                         'X-Exproxyment-Request-Version'),
-                                        (True, False)):
+        for required, headername in ((True, 'X-Exproxyment-Require-Version'),
+                                     (False, 'X-Exproxyment-Request-Version')):
             version = self.request.headers.get(headername, None)
             if version:
                 return required, version
 
         # get argument
-        for required, getargname in zip(('exproxyment_require_version',
-                                         'exproxyment_request_version'),
-                                        (True, False)):
+        for required, getargname in ((True, 'exproxyment_require_version'),
+                                     (False, 'exproxyment_request_version')):
             version = self.get_argument(getargname, None)
             if version:
                 return required, version
 
         # cookie
-        for required, cookiename in zip(('exproxyment_require_version',
-                                         'exproxyment_request_version'),
-                                        (True, False)):
+        for required, cookiename in ((True, 'exproxyment_require_version'),
+                                     (False, 'exproxyment_request_version')):
             version = self.request.cookies.get(cookiename)
             if version:
+                value = version.value
+                unquoted = urllib.unquote(value)
+                asjson = json.loads(unquoted)
+                version = asjson['version']
                 return required, version
 
         return False, None
@@ -319,7 +336,7 @@ class ProxyHandler(BaseHandler):
             return
 
         client = tornado.httpclient.AsyncHTTPClient()
-        url = 'http://%s:%d/%s' % (backend.host, backend.port, path)
+        uri = 'http://%s:%d/%s' % (backend.host, backend.port, path)
         method = self.request.method
 
         headers = tornado.httputil.HTTPHeaders()
@@ -333,16 +350,24 @@ class ProxyHandler(BaseHandler):
         if method != 'GET':
             body = self.request.body
 
+        active_request = ActiveRequest(source_host=self.request.remote_ip,
+                                       uri=uri, backend=backend)
+        server_state.requests.add(active_request)
+
         try:
-            response = yield client.fetch(url,
+            response = yield client.fetch(uri,
                                           method=method,
                                           headers=headers,
                                           body=body)
+
         except Exception as e:
             # TODO we can allow the client to specify whether
             # connection-refused type errors are retryable
             self.nope("bad connection to %r (%r)" % (backend, e))
             return
+
+        finally:
+            server_state.requests.remove(active_request)
 
         if (response.code == 406
                 and response.headers.get('X-Exproxyment-Wrong-Version')):
@@ -367,10 +392,10 @@ class ProxyHandler(BaseHandler):
             cookie_name = ('exproxyment_request_version'
                            if options.soft_sticky
                            else 'exproxyment_require_version')
-            cookie_value = urllib.quote(version)
-
-            self.add_header('Set-Cookie',
-                            '%s=%s' % (cookie_name, cookie_value))
+            cookie_value = urllib.quote(json.dumps({'version': version}))
+            self.set_cookie(cookie_name,
+                            cookie_value,
+                            options.cookie_domain or None)
 
         self.write(response.body)
 
@@ -397,19 +422,21 @@ class MyHealth(BaseHandler):
         if not healthy:
             self.set_status(500)
 
+        backends = []
+        for backend, state in server_state.backends.iteritems():
+            js = {}
+            js.update(backend.to_json())
+            js.update(state.to_json())
+            backends.append(js)
+        backends = sorted(backends,
+                          key=lambda x: (x['host'],
+                                         x['port']))
+
         ret = {
             'healthy': healthy,
             'versions': sorted(list(server_state.available_versions())),
-            'weights': server_state.weights,
-            'backends': sorted(({'host': backend.host,
-                                 'port': backend.port,
-                                 'healthy': state.healthy,
-                                 'version': state.version}
-                                for (backend, state)
-                                in server_state.backends.iteritems()),
-                               key=lambda x: (x['host'],
-                                              x['port'],
-                                              x['version'])),
+            'weights': server_state.weights, # already jsonnable
+            'backends': backends,
         }
 
         self.write_json(ret)
@@ -500,6 +527,17 @@ class DeregisterSelfHandler(BaseHandler):
         self.write_json({'status': 'ok'})
 
 
+class ExproxymentActivity(BaseHandler):
+
+    def get(self):
+        activity = []
+
+        for active_request in server_state.requests:
+            activity.append(active_request.to_json())
+
+        self.write_json({'activity': activity})
+
+
 class FourOhFour(BaseHandler):
 
     def get(self, *a):
@@ -530,6 +568,8 @@ class ExproxymentApplication(tornado.web.Application):
             (r"/exproxyment/configure", ExproxymentConfigure),
             (r"/exproxyment/register", RegisterSelfHandler),
             (r"/exproxyment/deregister", DeregisterSelfHandler),
+
+            (r"/exproxyment/activity", ExproxymentActivity),
 
             # reserve the rest of this namespace for ourselves
             (r"/exproxyment.+", FourOhFour),

@@ -1,5 +1,6 @@
 #!/usr/bin/env python2.7
 
+import sys
 import json
 import logging
 
@@ -16,6 +17,7 @@ define('remove', default=None, type=str)
 define('weights', default='')
 define('server', default='localhost:7000')
 define('health', default=False, type=bool)
+define('activity', default=False, type=bool)
 define('json', type=bool, default=False)
 
 
@@ -41,6 +43,8 @@ def configure(path, js=None):
 
 
 def main():
+    exit_status = 0
+
     parse_command_line()
 
     if options.backends or options.weights:
@@ -82,6 +86,26 @@ def main():
                     backend['version'] or 'unknown',
                     'healthy' if backend['healthy'] else 'unhealthy',
                 )
+
+        if not ret['healthy']:
+            # TODO right now configure() will bail with an exception before we
+            # get here
+            exit_status = 1
+
+    if options.activity:
+        ret = configure('/exproxyment/activity')
+        if options.json:
+            print json.dumps(ret)
+        else:
+            for activity in ret['activity']:
+                backend = activity['backend']
+                print '%s -> %s:%d %s' % (
+                    activity['source_host'],
+                    backend['host'], backend['port'],
+                    activity['uri'],
+                )
+
+    sys.exit(exit_status)
 
 
 if __name__ == "__main__":

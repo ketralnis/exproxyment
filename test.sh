@@ -1,5 +1,14 @@
 #!/bin/sh
 
+# This is the exproxyment "test suite". It's not very good, and it badly needs
+# replacement with real tests. Its only real goal is to exercise every line of
+# code, not verify actual correctness. To use:
+# 1. In one window, launch test.sh
+# 2. In another window, launch test2.sh
+# 3. Watch for exceptions in either window
+
+set -e
+
 export PYTHONPATH=.
 export LOGLEVEL=warn
 

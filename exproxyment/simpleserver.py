@@ -52,6 +52,16 @@ class HealthHandler(tornado.web.RequestHandler):
         self.write('\n')
 
 
+class SlowHandler(tornado.web.RequestHandler):
+
+    @tornado.gen.coroutine
+    def get(self):
+        yield tornado.gen.sleep(2)
+
+        self.write('I am the very model of some very model English text')
+        self.write('\n')
+
+
 def split_host(s):
     host, port = s.split(':')
     port = int(port)
@@ -101,6 +111,7 @@ def main():
     application = tornado.web.Application([
         (r"/", MainHandler),
         (r"/health", HealthHandler),
+        (r"/slow", SlowHandler),
     ])
 
     ioloop = tornado.ioloop.IOLoop.instance()
